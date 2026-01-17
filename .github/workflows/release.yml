@@ -1,0 +1,245 @@
+name: release
+
+on:
+  repository_dispatch:
+    types: [on-demand-release]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA to build"
+        required: true
+      repository:
+        description: "Optional: source repo full name (owner/name). Prefer using the SOURCE_REPO secret to avoid logging it."
+        required: false
+
+# Avoid concurrent publishes fighting over the same tag/release.
+concurrency:
+  group: release-${{ github.event.client_payload.sha || inputs.sha || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Resolve inputs
+        id: meta
+        shell: bash
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            SHA="${{ github.event.client_payload.sha }}"
+            FALLBACK_REPO="${{ github.event.client_payload.repository }}"
+          else
+            SHA="${{ inputs.sha }}"
+            FALLBACK_REPO="${{ inputs.repository }}"
+          fi
+
+          REPO="${SOURCE_REPO:-${FALLBACK_REPO}}"
+
+          if [[ -z "${SHA}" ]]; then
+            echo "sha is required." >&2
+            exit 1
+          fi
+
+          if [[ -z "${REPO}" ]]; then
+            echo "repository is required (set SOURCE_REPO secret, or pass repository in the dispatch payload / workflow input)." >&2
+            exit 1
+          fi
+
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          # Keep repo out of step outputs to reduce accidental logging in public CI.
+          echo "REPO=${REPO}" >> "$GITHUB_ENV"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check out source repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO }}
+          ref: ${{ steps.meta.outputs.sha }}
+          token: ${{ secrets.GH_TOKEN_FOR_CHECKOUT }}
+          path: project
+          fetch-depth: 1
+
+      - name: Read app version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./project/package.json').version")"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create/update draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ github.token }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          draft: true
+          prerelease: false
+          body: |
+            Build info:
+            - sha: ${{ steps.meta.outputs.sha }}
+            - version: ${{ steps.version.outputs.version }}
+
+  build:
+    needs: prepare
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            build_script: build:linux
+            name: linux
+          - os: windows-latest
+            build_script: build:win
+            name: windows
+          - os: macos-latest
+            build_script: build:mac
+            name: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Resolve repo
+        shell: bash
+        env:
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          FALLBACK_REPO: ${{ github.event.client_payload.repository || inputs.repository }}
+        run: |
+          set -euo pipefail
+          REPO="${SOURCE_REPO:-${FALLBACK_REPO}}"
+          if [[ -z "${REPO}" ]]; then
+            echo "repository is required (set SOURCE_REPO secret, or pass repository in the dispatch payload / workflow input)." >&2
+            exit 1
+          fi
+          echo "REPO=${REPO}" >> "$GITHUB_ENV"
+
+      - name: Check out source repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          token: ${{ secrets.GH_TOKEN_FOR_CHECKOUT }}
+          path: project
+          fetch-depth: 1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: project/pnpm-lock.yaml
+
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rpm fakeroot
+
+      - name: Install dependencies
+        working-directory: project
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: project
+        shell: bash
+        run: pnpm run typecheck
+
+      - name: Build (${{ matrix.name }})
+        working-directory: project
+        shell: bash
+        run: pnpm run ${{ matrix.build_script }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            project/dist/*.exe
+            project/dist/*.dmg
+            project/dist/*.AppImage
+            project/dist/*.deb
+            project/dist/*.rpm
+            project/dist/*.zip
+            project/dist/latest*.yml
+            project/dist/*.blockmap
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload assets to draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
+          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            notes=$'Build info:\n'
+            notes+=$'- sha: '"${SHA}"$'\n'
+            notes+=$'- version: '"${VERSION}"$'\n'
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --draft \
+              --title "${TAG}" \
+              --notes "${notes}"
+          fi
+
+          mapfile -d '' files < <(find artifacts -type f \( \
+            -name '*.exe' -o \
+            -name '*.dmg' -o \
+            -name '*.AppImage' -o \
+            -name '*.deb' -o \
+            -name '*.rpm' -o \
+            -name '*.zip' -o \
+            -name 'latest*.yml' -o \
+            -name '*.blockmap' \
+          \) -print0)
+
+          if (( ${#files[@]} == 0 )); then
+            echo "No matching release files found under artifacts/." >&2
+            exit 1
+          fi
+
+          gh release upload "${TAG}" "${files[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
